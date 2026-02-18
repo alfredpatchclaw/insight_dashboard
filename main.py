@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import random
+import asyncio
 from datetime import datetime
 from typing import List, Optional, Dict
 from fastapi import FastAPI
@@ -12,6 +13,14 @@ import uvicorn
 SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
+
+# --- Global Cache (v1.6 Performance) ---
+dashboard_cache = {
+    "active": [],
+    "totals": {"cost": 0.0, "in": 0, "out": 0},
+    "history": [],
+    "last_update": None
+}
 
 # --- Database Setup ---
 def init_db():
@@ -75,7 +84,6 @@ def extract_usage(obj):
     return usage
 
 def is_calling_claude(obj):
-    """Detect if the log entry contains a tool call to 'claude' via exec."""
     if isinstance(obj, dict) and obj.get("type") == "message":
         msg = obj.get("message", {})
         content = msg.get("content", [])
@@ -84,91 +92,98 @@ def is_calling_claude(obj):
                 if part.get("type") == "toolCall" and part.get("name") == "exec":
                     args = part.get("arguments", {})
                     cmd = args.get("command", "")
-                    if "claude" in cmd.lower():
-                        return True
+                    if "claude" in cmd.lower(): return True
     return False
 
-# --- OpenClaw Session Monitor ---
-async def get_dashboard_data():
-    active_map: Dict[str, dict] = {}
-    total_cost = 0.0
-    total_tokens_in = 0
-    total_tokens_out = 0
-    now = datetime.now().timestamp()
-    
-    if not os.path.exists(SESSIONS_DIR):
-        return {"active": [], "totals": {"cost": 0, "in": 0, "out": 0}}
-    
-    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
-    
-    for filename in files:
-        filepath = os.path.join(SESSIONS_DIR, filename)
-        session_id = filename.split('.')[0]
+# --- Background Task (The Engine) ---
+async def update_cache_loop():
+    while True:
         try:
-            mtime = os.path.getmtime(filepath)
-            if (now - mtime) > 86400: continue
-
-            using_claude = False
-            last_msg = "Working..."
+            active_map: Dict[str, dict] = {}
+            total_cost = 0.0
+            total_tokens_in = 0
+            total_tokens_out = 0
+            now = datetime.now().timestamp()
             
-            with open(filepath, 'r') as f:
-                for line in f:
+            if os.path.exists(SESSIONS_DIR):
+                files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
+                for filename in files:
+                    filepath = os.path.join(SESSIONS_DIR, filename)
+                    session_id = filename.split('.')[0]
                     try:
-                        data = json.loads(line)
-                        total_cost += extract_cost(data)
-                        usage = extract_usage(data)
-                        total_tokens_in += usage["in"]
-                        total_tokens_out += usage["out"]
+                        mtime = os.path.getmtime(filepath)
+                        if (now - mtime) > 86400: continue
+
+                        using_claude = False
+                        last_msg = "Working..."
                         
-                        # Update using_claude status based on any call in the session history (simple version)
-                        # or more accurately, based on the very latest entries.
-                        if is_calling_claude(data):
-                            using_claude = True
+                        with open(filepath, 'r') as f:
+                            for line in f:
+                                try:
+                                    data = json.loads(line.strip())
+                                    total_cost += extract_cost(data)
+                                    usage = extract_usage(data)
+                                    total_tokens_in += usage["in"]
+                                    total_tokens_out += usage["out"]
+                                    if is_calling_claude(data): using_claude = True
+                                except: continue
+
+                        if (now - mtime) < 120:
+                            with open(filepath, 'rb') as f:
+                                try:
+                                    f.seek(-2, os.SEEK_END)
+                                    while f.read(1) != b'\n': f.seek(-2, os.SEEK_CUR)
+                                except: f.seek(0)
+                                last_data = json.loads(f.readline().decode())
+                                if last_data.get("type") == "message":
+                                    m = last_data["message"]
+                                    content = m.get("content", [])
+                                    if isinstance(content, list):
+                                        for c in content:
+                                            if c.get("type") == "text": last_msg = c.get("text", "")
+                                    elif isinstance(content, str): last_msg = content
+                            
+                            if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado"]):
+                                alias = get_alias(session_id)
+                                if alias not in active_map:
+                                    active_map[alias] = {
+                                        "name": alias, "id": session_id[:8], 
+                                        "last": last_msg[:80], "count": 1, 
+                                        "mtime": mtime, "using_claude": using_claude
+                                    }
+                                else:
+                                    active_map[alias]["count"] += 1
+                                    if using_claude: active_map[alias]["using_claude"] = True
                     except: continue
 
-            if (now - mtime) < 120:
-                with open(filepath, 'rb') as f:
-                    try:
-                        f.seek(-2, os.SEEK_END)
-                        while f.read(1) != b'\n': f.seek(-2, os.SEEK_CUR)
-                    except: f.seek(0)
-                    last_data = json.loads(f.readline().decode())
-                    if last_data.get("type") == "message":
-                        m = last_data["message"]
-                        content = m.get("content", [])
-                        if isinstance(content, list):
-                            for c in content:
-                                if c.get("type") == "text": last_msg = c.get("text", "")
-                        elif isinstance(content, str): last_msg = content
-                
-                if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado"]):
-                    alias = get_alias(session_id)
-                    if alias not in active_map:
-                        active_map[alias] = {
-                            "name": alias, "id": session_id[:8], 
-                            "last": last_msg[:80], "count": 1, 
-                            "mtime": mtime, "using_claude": using_claude
-                        }
-                    else:
-                        active_map[alias]["count"] += 1
-                        if using_claude: active_map[alias]["using_claude"] = True
-        except: continue
+            # Update Global Cache
+            dashboard_cache["active"] = sorted(list(active_map.values()), key=lambda x: (x['name'] != 'Alfred', x['mtime']))
+            dashboard_cache["totals"] = {"cost": round(total_cost, 4), "in": total_tokens_in, "out": total_tokens_out}
             
-    active = list(active_map.values())
-    active.sort(key=lambda x: (x['name'] != 'Alfred', x['mtime']))
-    return {"active": active, "totals": {"cost": round(total_cost, 4), "in": total_tokens_in, "out": total_tokens_out}}
+            # Update History from DB
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 15")
+            dashboard_cache["history"] = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0] if 'T' in r[1] else r[1], "agent": r[3], "task": r[4]} for r in c.fetchall()]
+            conn.close()
+            
+            dashboard_cache["last_update"] = datetime.now().isoformat()
+            
+        except Exception as e:
+            print(f"Cache update error: {e}")
+            
+        await asyncio.sleep(10) # Update every 10 seconds
 
-app = FastAPI(title="OpenClaw Insight Dashboard v1.5")
+# --- FastAPI App ---
+app = FastAPI(title="OpenClaw Insight Dashboard v1.6")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(update_cache_loop())
 
 @app.get("/api/status")
 async def get_status():
-    data = await get_dashboard_data()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 10")
-    history = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0] if 'T' in r[1] else r[1], "agent": r[3], "task": r[4]} for r in c.fetchall()]
-    conn.close()
-    return {**data, "history": history}
+    return dashboard_cache
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -176,7 +191,7 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>OpenClaw Insight v1.5</title>
+        <meta charset="UTF-8"><title>OpenClaw Insight v1.6 (Turbo)</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <style> 
             @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } 
@@ -189,8 +204,13 @@ async def index():
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center">
-                <div class="flex items-center gap-2 text-white font-bold"><span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.5</span></div>
-                <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full"><span class="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block mr-1 pulse"></span> LIVE</div>
+                <div class="flex items-center gap-2 text-white font-bold">
+                    <span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.6 (Turbo)</span>
+                </div>
+                <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full flex items-center gap-2">
+                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse"></span> CACHED LIVE
+                    <span id="update-ts" class="text-slate-500 font-normal"></span>
+                </div>
             </div>
         </nav>
         <main class="max-w-5xl mx-auto p-6 space-y-6">
@@ -224,6 +244,7 @@ async def index():
                 try {
                     const r = await fetch('/api/status');
                     const d = await r.json();
+                    if(d.last_update) document.getElementById('update-ts').innerText = 'Last sync: ' + d.last_update.split('T')[1].split('.')[0];
                     document.getElementById('cost').innerText = d.totals.cost.toFixed(4);
                     document.getElementById('tin').innerText = d.totals.in.toLocaleString();
                     document.getElementById('tout').innerText = d.totals.out.toLocaleString();
@@ -232,7 +253,7 @@ async def index():
                             <div class="flex justify-between text-xs mb-1">
                                 <span class="font-bold flex items-center gap-2 ${a.name==='Alfred'?'text-blue-400':'text-white'}">
                                     ${a.name} ${a.count>1?'('+a.count+')':''}
-                                    ${a.using_claude ? '<span class="claude-icon" title="Using Claude Code">⚡</span>' : ''}
+                                    ${a.using_claude ? '<span class="claude-icon">⚡</span>' : ''}
                                 </span>
                                 <span class="text-slate-600 font-mono">${a.id}</span>
                             </div>
