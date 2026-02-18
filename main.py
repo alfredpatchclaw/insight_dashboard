@@ -11,7 +11,6 @@ import uvicorn
 # --- Configuration ---
 SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
-
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
 # --- Database Setup ---
@@ -49,27 +48,19 @@ def get_alias(session_id: str) -> str:
     return alias
 
 def extract_cost(obj):
-    """Deep search for cost values in nested dictionaries."""
     cost = 0.0
     if isinstance(obj, dict):
-        # Direct 'total' key
         if "total" in obj and isinstance(obj["total"], (int, float)):
             return float(obj["total"])
-        # Check for 'cost' dictionary or value
         if "cost" in obj:
             c = obj["cost"]
-            if isinstance(c, dict):
-                return extract_cost(c)
-            elif isinstance(c, (int, float)):
-                return float(c)
-        # Recurse into usage or message
+            if isinstance(c, dict): return extract_cost(c)
+            elif isinstance(c, (int, float)): return float(c)
         for k in ["usage", "message"]:
-            if k in obj:
-                cost += extract_cost(obj[k])
+            if k in obj: cost += extract_cost(obj[k])
     return cost
 
 def extract_usage(obj):
-    """Extract input/output tokens."""
     usage = {"in": 0, "out": 0}
     if isinstance(obj, dict):
         if "usage" in obj:
@@ -83,17 +74,31 @@ def extract_usage(obj):
             usage["out"] += res["out"]
     return usage
 
+def is_calling_claude(obj):
+    """Detect if the log entry contains a tool call to 'claude' via exec."""
+    if isinstance(obj, dict) and obj.get("type") == "message":
+        msg = obj.get("message", {})
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for part in content:
+                if part.get("type") == "toolCall" and part.get("name") == "exec":
+                    args = part.get("arguments", {})
+                    cmd = args.get("command", "")
+                    if "claude" in cmd.lower():
+                        return True
+    return False
+
 # --- OpenClaw Session Monitor ---
 async def get_dashboard_data():
     active_map: Dict[str, dict] = {}
     total_cost = 0.0
     total_tokens_in = 0
     total_tokens_out = 0
+    now = datetime.now().timestamp()
     
     if not os.path.exists(SESSIONS_DIR):
         return {"active": [], "totals": {"cost": 0, "in": 0, "out": 0}}
     
-    now = datetime.now().timestamp()
     files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
     
     for filename in files:
@@ -101,9 +106,11 @@ async def get_dashboard_data():
         session_id = filename.split('.')[0]
         try:
             mtime = os.path.getmtime(filepath)
-            if (now - mtime) > 86400: # 24h
-                continue
+            if (now - mtime) > 86400: continue
 
+            using_claude = False
+            last_msg = "Working..."
+            
             with open(filepath, 'r') as f:
                 for line in f:
                     try:
@@ -112,51 +119,46 @@ async def get_dashboard_data():
                         usage = extract_usage(data)
                         total_tokens_in += usage["in"]
                         total_tokens_out += usage["out"]
-                    except:
-                        continue
+                        
+                        # Update using_claude status based on any call in the session history (simple version)
+                        # or more accurately, based on the very latest entries.
+                        if is_calling_claude(data):
+                            using_claude = True
+                    except: continue
 
             if (now - mtime) < 120:
                 with open(filepath, 'rb') as f:
                     try:
                         f.seek(-2, os.SEEK_END)
-                        while f.read(1) != b'\n':
-                            f.seek(-2, os.SEEK_CUR)
-                    except:
-                        f.seek(0)
-                    last_line = f.readline().decode()
-                    data = json.loads(last_line)
-                    
-                    last_msg = "Working..."
-                    if "message" in data:
-                        m = data["message"]
-                        if "content" in m and isinstance(m["content"], list):
-                            for c in m["content"]:
+                        while f.read(1) != b'\n': f.seek(-2, os.SEEK_CUR)
+                    except: f.seek(0)
+                    last_data = json.loads(f.readline().decode())
+                    if last_data.get("type") == "message":
+                        m = last_data["message"]
+                        content = m.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
                                 if c.get("type") == "text": last_msg = c.get("text", "")
-                        elif "text" in m: last_msg = m["text"]
-
-                    if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado con éxito"]):
-                        alias = get_alias(session_id)
-                        if alias not in active_map:
-                            active_map[alias] = {"name": alias, "id": session_id[:8], "last": last_msg[:80], "count": 1, "mtime": mtime}
-                        else:
-                            active_map[alias]["count"] += 1
-        except:
-            continue
+                        elif isinstance(content, str): last_msg = content
+                
+                if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado"]):
+                    alias = get_alias(session_id)
+                    if alias not in active_map:
+                        active_map[alias] = {
+                            "name": alias, "id": session_id[:8], 
+                            "last": last_msg[:80], "count": 1, 
+                            "mtime": mtime, "using_claude": using_claude
+                        }
+                    else:
+                        active_map[alias]["count"] += 1
+                        if using_claude: active_map[alias]["using_claude"] = True
+        except: continue
             
     active = list(active_map.values())
     active.sort(key=lambda x: (x['name'] != 'Alfred', x['mtime']))
-    
-    return {
-        "active": active,
-        "totals": {
-            "cost": round(total_cost, 4),
-            "in": total_tokens_in,
-            "out": total_tokens_out
-        }
-    }
+    return {"active": active, "totals": {"cost": round(total_cost, 4), "in": total_tokens_in, "out": total_tokens_out}}
 
-# --- FastAPI App ---
-app = FastAPI(title="OpenClaw Insight Dashboard v1.4.6")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.5")
 
 @app.get("/api/status")
 async def get_status():
@@ -174,14 +176,20 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>OpenClaw Insight v1.4.6</title>
+        <meta charset="UTF-8"><title>OpenClaw Insight v1.5</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <style> @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } .pulse { animation: pulse 2s infinite; } .alfred { border-color: rgba(59,130,246,0.5); box-shadow: 0 0 10px rgba(59,130,246,0.2); } </style>
+        <style> 
+            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } 
+            @keyframes glow { 0%, 100% { text-shadow: 0 0 5px #a855f7; } 50% { text-shadow: 0 0 20px #a855f7; } }
+            .pulse { animation: pulse 2s infinite; } 
+            .claude-icon { color: #a855f7; animation: glow 2s infinite; }
+            .alfred { border-color: rgba(59,130,246,0.5); box-shadow: 0 0 10px rgba(59,130,246,0.2); } 
+        </style>
     </head>
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center">
-                <div class="flex items-center gap-2 text-white font-bold"><span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.4.6</span></div>
+                <div class="flex items-center gap-2 text-white font-bold"><span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.5</span></div>
                 <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full"><span class="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block mr-1 pulse"></span> LIVE</div>
             </div>
         </nav>
@@ -222,7 +230,10 @@ async def index():
                     document.getElementById('active').innerHTML = d.active.map(a => `
                         <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg ${a.name==='Alfred'?'alfred':''}">
                             <div class="flex justify-between text-xs mb-1">
-                                <span class="font-bold ${a.name==='Alfred'?'text-blue-400':'text-white'}">${a.name} ${a.count>1?'('+a.count+')':''}</span>
+                                <span class="font-bold flex items-center gap-2 ${a.name==='Alfred'?'text-blue-400':'text-white'}">
+                                    ${a.name} ${a.count>1?'('+a.count+')':''}
+                                    ${a.using_claude ? '<span class="claude-icon" title="Using Claude Code">⚡</span>' : ''}
+                                </span>
                                 <span class="text-slate-600 font-mono">${a.id}</span>
                             </div>
                             <div class="text-[11px] text-slate-500 italic truncate">$ ${a.last}</div>
