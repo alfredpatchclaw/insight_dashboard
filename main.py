@@ -1,17 +1,18 @@
 import os
 import json
 import sqlite3
-import asyncio
+import random
 from datetime import datetime
-from typing import List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import List, Optional, Dict
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 import uvicorn
 
 # --- Configuration ---
-SESSIONS_DIR = "/home/claw/.openclaw/sessions"
+SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
+
+BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
 # --- Database Setup ---
 def init_db():
@@ -23,44 +24,97 @@ def init_db():
                   agent_id TEXT, 
                   agent_name TEXT, 
                   task TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS agent_aliases
+                 (session_id TEXT PRIMARY KEY, 
+                  alias TEXT)''')
+    c.execute("INSERT OR IGNORE INTO agent_aliases (session_id, alias) VALUES (?, ?)", 
+              ("b6a17b63-f710-444a-9091-74c2ea6238d6", "Alfred"))
     conn.commit()
     conn.close()
 
 init_db()
 
-def log_to_history(agent_id, name, task):
+def get_alias(session_id: str) -> str:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO history (timestamp, agent_id, agent_name, task) VALUES (?, ?, ?, ?)",
-              (datetime.now().isoformat(), agent_id, name, task))
-    conn.commit()
+    c.execute("SELECT alias FROM agent_aliases WHERE session_id = ?", (session_id,))
+    row = c.fetchone()
+    if row:
+        alias = row[0]
+    else:
+        alias = random.choice(BUTLER_NAMES)
+        c.execute("INSERT INTO agent_aliases (session_id, alias) VALUES (?, ?)", (session_id, alias))
+        conn.commit()
     conn.close()
+    return alias
 
 # --- OpenClaw Session Monitor ---
 async def get_active_sessions():
-    sessions = []
+    active_map: Dict[str, dict] = {}
     if not os.path.exists(SESSIONS_DIR):
         return []
     
-    for filename in os.listdir(SESSIONS_DIR):
-        if filename.endswith(".json"):
-            try:
-                with open(os.path.join(SESSIONS_DIR, filename), 'r') as f:
-                    data = json.load(f)
-                    # Filter for sessions updated in the last 5 minutes as 'active'
-                    mtime = os.path.getmtime(os.path.join(SESSIONS_DIR, filename))
-                    is_active = (datetime.now().timestamp() - mtime) < 300
-                    
-                    if is_active:
-                        sessions.append({
-                            "id": data.get("key", filename),
-                            "name": data.get("label", "Unknown Agent"),
-                            "status": "active",
-                            "last_message": data.get("history", [{}])[-1].get("text", "No messages yet")[:100] + "..."
-                        })
-            except:
+    now = datetime.now().timestamp()
+    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
+    
+    for filename in files:
+        filepath = os.path.join(SESSIONS_DIR, filename)
+        session_id = filename.split('.')[0]
+        try:
+            mtime = os.path.getmtime(filepath)
+            # v1.3: Narrow window (120s) and filter noise
+            diff = now - mtime
+            if diff > 120:
                 continue
-    return sessions
+            
+            with open(filepath, 'rb') as f:
+                try:
+                    f.seek(-2, os.SEEK_END)
+                    while f.read(1) != b'\n':
+                        f.seek(-2, os.SEEK_CUR)
+                except OSError:
+                    f.seek(0)
+                last_line = f.readline().decode()
+                data = json.loads(last_line)
+                
+                last_msg = ""
+                if "message" in data:
+                    msg = data["message"]
+                    if "content" in msg and isinstance(msg["content"], list):
+                        for c in msg["content"]:
+                            if c.get("type") == "text":
+                                last_msg += c.get("text", "")
+                    elif "text" in msg:
+                        last_msg = msg["text"]
+                
+                # Filter out Keeper/Maintenance noise
+                noise_keywords = ["dashboard on port 8050 is down", "reactivado con éxito", "restaurado exitosamente"]
+                if any(kw in last_msg.lower() for kw in noise_keywords):
+                    continue
+
+                alias = get_alias(session_id)
+                
+                if alias in active_map:
+                    active_map[alias]["count"] += 1
+                    if mtime > active_map[alias]["mtime"]:
+                        active_map[alias]["last_message"] = last_msg[:80] + "..."
+                        active_map[alias]["mtime"] = mtime
+                else:
+                    active_map[alias] = {
+                        "name": alias,
+                        "id_short": session_id[:8],
+                        "last_message": last_msg[:80] + "...",
+                        "count": 1,
+                        "mtime": mtime,
+                        "last_seen": int(diff)
+                    }
+        except:
+            continue
+            
+    # Convert to sorted list (Alfred first)
+    result = list(active_map.values())
+    result.sort(key=lambda x: (x['name'] != 'Alfred', x['mtime']), reverse=False)
+    return result
 
 # --- FastAPI App ---
 app = FastAPI(title="OpenClaw Insight Dashboard")
@@ -70,8 +124,8 @@ async def get_status():
     active = await get_active_sessions()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 10")
-    history = [{"id": r[0], "time": r[1], "agent": r[3], "task": r[4]} for r in c.fetchall()]
+    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 15")
+    history = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0], "agent": r[3], "task": r[4]} for r in c.fetchall()]
     conn.close()
     return {"active": active, "history": history}
 
@@ -83,72 +137,44 @@ async def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OpenClaw Insight</title>
+        <title>OpenClaw Insight v1.3</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
             @keyframes pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-            .pulse { animation: pulse-soft 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+            .pulse { animation: pulse-soft 2s infinite; }
+            .alfred-glow { box-shadow: 0 0 15px rgba(59, 130, 246, 0.3); border-color: rgba(59, 130, 246, 0.5); }
         </style>
     </head>
-    <body class="bg-[#0f172a] text-slate-200 font-sans min-h-screen">
-        <nav class="border-b border-slate-800 bg-[#1e293b]/50 backdrop-blur-md sticky top-0 z-50">
-            <div class="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
+    <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
+        <nav class="border-b border-slate-800 bg-[#111827]/80 backdrop-blur-md sticky top-0 z-50">
+            <div class="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
                 <div class="flex items-center gap-3">
-                    <span class="text-3xl">🎩</span>
-                    <div>
-                        <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
-                            OpenClaw Insight
-                        </h1>
-                        <p class="text-[10px] uppercase tracking-widest text-slate-500 font-bold">Architect Dashboard</p>
-                    </div>
+                    <span class="text-2xl">🎩</span>
+                    <h1 class="text-lg font-bold tracking-tight text-white">OpenClaw <span class="text-blue-500">Insight</span> <span class="text-[10px] bg-slate-800 px-1.5 py-0.5 rounded text-slate-400 ml-1">v1.3</span></h1>
                 </div>
-                <div class="flex items-center gap-4">
-                    <div id="connection-status" class="flex items-center gap-2 px-3 py-1 bg-emerald-500/10 text-emerald-400 rounded-full border border-emerald-500/20 text-xs font-medium">
-                        <span class="w-2 h-2 bg-emerald-500 rounded-full pulse"></span>
-                        LIVE
-                    </div>
+                <div id="connection-status" class="flex items-center gap-2 text-[10px] font-bold text-emerald-500 bg-emerald-500/10 px-2 py-1 rounded-full border border-emerald-500/20">
+                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse"></span> MONITORING LIVE
                 </div>
             </div>
         </nav>
 
-        <main class="max-w-7xl mx-auto px-6 py-8">
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                <!-- Active Column -->
-                <div class="lg:col-span-2 space-y-6">
-                    <section>
-                        <div class="flex items-center justify-between mb-4">
-                            <h2 class="text-lg font-semibold flex items-center gap-2">
-                                <span class="text-blue-400">●</span> Agentes Activos
-                            </h2>
-                            <span id="active-count" class="text-xs bg-slate-800 px-2 py-0.5 rounded text-slate-400 font-mono">0</span>
-                        </div>
-                        <div id="active-list" class="grid gap-4">
-                            <!-- JS populated -->
-                        </div>
-                    </section>
-
-                    <section>
-                        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
-                            <span class="text-amber-400">◔</span> Actividad en Tiempo Real
-                        </h2>
-                        <div class="bg-black/40 border border-slate-800 rounded-xl p-4 font-mono text-sm h-64 overflow-y-auto" id="log-stream">
-                            <div class="text-slate-600 font-bold">[SYSTEM] Monitoring /sessions...</div>
-                        </div>
-                    </section>
-                </div>
-
-                <!-- History Column -->
-                <div class="space-y-6">
-                    <section>
-                        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
-                            <span class="text-purple-400">◈</span> Historial
-                        </h2>
-                        <div id="history-list" class="space-y-3">
-                            <!-- JS populated -->
-                        </div>
-                    </section>
-                </div>
+        <main class="max-w-6xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div class="lg:col-span-2 space-y-8">
+                <section>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-sm font-bold uppercase tracking-widest text-slate-500">Agentes Activos</h2>
+                        <span id="active-count" class="text-xs font-mono text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">0</span>
+                    </div>
+                    <div id="active-list" class="grid gap-3"></div>
+                </section>
             </div>
+
+            <aside class="space-y-8">
+                <section>
+                    <h2 class="text-sm font-bold uppercase tracking-widest text-slate-500 mb-4">Historial Reciente</h2>
+                    <div id="history-list" class="space-y-2 border-l border-slate-800 ml-2"></div>
+                </section>
+            </aside>
         </main>
 
         <script>
@@ -157,46 +183,40 @@ async def index():
                     const res = await fetch('/api/status');
                     const data = await res.json();
                     
-                    // Active List
                     const activeList = document.getElementById('active-list');
                     document.getElementById('active-count').innerText = data.active.length;
                     
                     if(data.active.length === 0) {
-                        activeList.innerHTML = `
-                            <div class="p-8 border-2 border-dashed border-slate-800 rounded-xl text-center text-slate-500">
-                                No hay agentes trabajando activamente ahora mismo.
-                            </div>
-                        `;
+                        activeList.innerHTML = '<div class="py-12 border border-dashed border-slate-800 rounded-2xl text-center text-slate-600 text-sm">Silencio en el sistema...</div>';
                     } else {
                         activeList.innerHTML = data.active.map(a => `
-                            <div class="bg-slate-800/50 border border-slate-700 p-4 rounded-xl hover:border-blue-500/50 transition-colors group">
-                                <div class="flex justify-between items-start mb-2">
-                                    <div class="font-bold text-blue-300 flex items-center gap-2">
-                                        ${a.name}
-                                        <span class="text-[10px] font-mono bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded border border-blue-500/20 uppercase">${a.id.split(':')[0]}</span>
+                            <div class="bg-[#1e293b]/40 border border-slate-800 p-4 rounded-xl transition-all ${a.name === 'Alfred' ? 'alfred-glow bg-blue-500/5' : ''}">
+                                <div class="flex justify-between items-center mb-1">
+                                    <div class="flex items-center gap-2">
+                                        <span class="font-bold ${a.name === 'Alfred' ? 'text-blue-400' : 'text-slate-200'}">${a.name}</span>
+                                        ${a.count > 1 ? `<span class="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full border border-slate-700">${a.count} tareas</span>` : ''}
                                     </div>
-                                    <span class="text-[10px] text-slate-500 font-mono">${new Date().toLocaleTimeString()}</span>
+                                    <span class="text-[9px] font-mono text-slate-500 italic">${a.last_seen}s ago</span>
                                 </div>
-                                <p class="text-sm text-slate-400 line-clamp-2 italic">"${a.last_message}"</p>
+                                <p class="text-xs text-slate-500 truncate font-mono bg-black/20 p-2 rounded mt-2 border border-white/5">
+                                    <span class="text-blue-500/50 mr-1">$</span>${a.last_message}
+                                </p>
                             </div>
                         `).join('');
                     }
 
-                    // History List
                     const historyList = document.getElementById('history-list');
-                    historyList.innerHTML = data.history.map(h => `
-                        <div class="text-sm p-3 border-l-2 border-slate-700 bg-slate-800/20 hover:bg-slate-800/40 transition-colors">
-                            <div class="text-slate-500 text-[10px] mb-1">${h.time.split('T')[1].split('.')[0]}</div>
-                            <div class="font-medium text-slate-300">${h.agent}</div>
-                            <div class="text-xs text-slate-500 truncate">${h.task}</div>
+                    historyList.innerHTML = data.history.length ? data.history.map(h => `
+                        <div class="pl-4 pb-4 relative">
+                            <div class="absolute w-2 h-2 bg-slate-800 rounded-full -left-[4.5px] top-1.5 border border-[#0b1120]"></div>
+                            <div class="text-[9px] text-slate-600 font-mono mb-0.5">${h.time}</div>
+                            <div class="text-xs font-semibold text-slate-400">${h.agent}</div>
+                            <div class="text-[10px] text-slate-600 truncate">${h.task}</div>
                         </div>
-                    `).join('');
+                    `).join('') : '<div class="pl-4 text-slate-700 text-[10px] italic">Esperando eventos...</div>';
 
-                } catch (e) {
-                    console.error(e);
-                }
+                } catch (e) { console.error(e); }
             }
-
             setInterval(update, 2000);
             update();
         </script>
