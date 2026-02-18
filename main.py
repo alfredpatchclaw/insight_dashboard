@@ -48,11 +48,50 @@ def get_alias(session_id: str) -> str:
     conn.close()
     return alias
 
+def extract_cost(obj):
+    """Deep search for cost values in nested dictionaries."""
+    cost = 0.0
+    if isinstance(obj, dict):
+        # Direct 'total' key
+        if "total" in obj and isinstance(obj["total"], (int, float)):
+            return float(obj["total"])
+        # Check for 'cost' dictionary or value
+        if "cost" in obj:
+            c = obj["cost"]
+            if isinstance(c, dict):
+                return extract_cost(c)
+            elif isinstance(c, (int, float)):
+                return float(c)
+        # Recurse into usage or message
+        for k in ["usage", "message"]:
+            if k in obj:
+                cost += extract_cost(obj[k])
+    return cost
+
+def extract_usage(obj):
+    """Extract input/output tokens."""
+    usage = {"in": 0, "out": 0}
+    if isinstance(obj, dict):
+        if "usage" in obj:
+            u = obj["usage"]
+            if isinstance(u, dict):
+                usage["in"] += u.get("input", 0)
+                usage["out"] += u.get("output", 0)
+        if "message" in obj:
+            res = extract_usage(obj["message"])
+            usage["in"] += res["in"]
+            usage["out"] += res["out"]
+    return usage
+
 # --- OpenClaw Session Monitor ---
-async def get_active_sessions():
+async def get_dashboard_data():
     active_map: Dict[str, dict] = {}
+    total_cost = 0.0
+    total_tokens_in = 0
+    total_tokens_out = 0
+    
     if not os.path.exists(SESSIONS_DIR):
-        return []
+        return {"active": [], "totals": {"cost": 0, "in": 0, "out": 0}}
     
     now = datetime.now().timestamp()
     files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
@@ -62,72 +101,72 @@ async def get_active_sessions():
         session_id = filename.split('.')[0]
         try:
             mtime = os.path.getmtime(filepath)
-            # v1.3: Narrow window (120s) and filter noise
-            diff = now - mtime
-            if diff > 120:
+            if (now - mtime) > 86400: # 24h
                 continue
-            
-            with open(filepath, 'rb') as f:
-                try:
-                    f.seek(-2, os.SEEK_END)
-                    while f.read(1) != b'\n':
-                        f.seek(-2, os.SEEK_CUR)
-                except OSError:
-                    f.seek(0)
-                last_line = f.readline().decode()
-                data = json.loads(last_line)
-                
-                last_msg = ""
-                if "message" in data:
-                    msg = data["message"]
-                    if "content" in msg and isinstance(msg["content"], list):
-                        for c in msg["content"]:
-                            if c.get("type") == "text":
-                                last_msg += c.get("text", "")
-                    elif "text" in msg:
-                        last_msg = msg["text"]
-                
-                # Filter out Keeper/Maintenance noise
-                noise_keywords = ["dashboard on port 8050 is down", "reactivado con éxito", "restaurado exitosamente"]
-                if any(kw in last_msg.lower() for kw in noise_keywords):
-                    continue
 
-                alias = get_alias(session_id)
-                
-                if alias in active_map:
-                    active_map[alias]["count"] += 1
-                    if mtime > active_map[alias]["mtime"]:
-                        active_map[alias]["last_message"] = last_msg[:80] + "..."
-                        active_map[alias]["mtime"] = mtime
-                else:
-                    active_map[alias] = {
-                        "name": alias,
-                        "id_short": session_id[:8],
-                        "last_message": last_msg[:80] + "...",
-                        "count": 1,
-                        "mtime": mtime,
-                        "last_seen": int(diff)
-                    }
+            with open(filepath, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        total_cost += extract_cost(data)
+                        usage = extract_usage(data)
+                        total_tokens_in += usage["in"]
+                        total_tokens_out += usage["out"]
+                    except:
+                        continue
+
+            if (now - mtime) < 120:
+                with open(filepath, 'rb') as f:
+                    try:
+                        f.seek(-2, os.SEEK_END)
+                        while f.read(1) != b'\n':
+                            f.seek(-2, os.SEEK_CUR)
+                    except:
+                        f.seek(0)
+                    last_line = f.readline().decode()
+                    data = json.loads(last_line)
+                    
+                    last_msg = "Working..."
+                    if "message" in data:
+                        m = data["message"]
+                        if "content" in m and isinstance(m["content"], list):
+                            for c in m["content"]:
+                                if c.get("type") == "text": last_msg = c.get("text", "")
+                        elif "text" in m: last_msg = m["text"]
+
+                    if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado con éxito"]):
+                        alias = get_alias(session_id)
+                        if alias not in active_map:
+                            active_map[alias] = {"name": alias, "id": session_id[:8], "last": last_msg[:80], "count": 1, "mtime": mtime}
+                        else:
+                            active_map[alias]["count"] += 1
         except:
             continue
             
-    # Convert to sorted list (Alfred first)
-    result = list(active_map.values())
-    result.sort(key=lambda x: (x['name'] != 'Alfred', x['mtime']), reverse=False)
-    return result
+    active = list(active_map.values())
+    active.sort(key=lambda x: (x['name'] != 'Alfred', x['mtime']))
+    
+    return {
+        "active": active,
+        "totals": {
+            "cost": round(total_cost, 4),
+            "in": total_tokens_in,
+            "out": total_tokens_out
+        }
+    }
 
 # --- FastAPI App ---
-app = FastAPI(title="OpenClaw Insight Dashboard")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.4.6")
 
 @app.get("/api/status")
 async def get_status():
-    active = await get_active_sessions()
+    data = await get_dashboard_data()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 15")
-    history = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0], "agent": r[3], "task": r[4]} for r in c.fetchall()]
+    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 10")
+    history = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0] if 'T' in r[1] else r[1], "agent": r[3], "task": r[4]} for r in c.fetchall()]
     conn.close()
-    return {"active": active, "history": history}
+    return {**data, "history": history}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -135,90 +174,66 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OpenClaw Insight v1.3</title>
+        <meta charset="UTF-8"><title>OpenClaw Insight v1.4.6</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            @keyframes pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-            .pulse { animation: pulse-soft 2s infinite; }
-            .alfred-glow { box-shadow: 0 0 15px rgba(59, 130, 246, 0.3); border-color: rgba(59, 130, 246, 0.5); }
-        </style>
+        <style> @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } .pulse { animation: pulse 2s infinite; } .alfred { border-color: rgba(59,130,246,0.5); box-shadow: 0 0 10px rgba(59,130,246,0.2); } </style>
     </head>
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
-        <nav class="border-b border-slate-800 bg-[#111827]/80 backdrop-blur-md sticky top-0 z-50">
-            <div class="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
-                <div class="flex items-center gap-3">
-                    <span class="text-2xl">🎩</span>
-                    <h1 class="text-lg font-bold tracking-tight text-white">OpenClaw <span class="text-blue-500">Insight</span> <span class="text-[10px] bg-slate-800 px-1.5 py-0.5 rounded text-slate-400 ml-1">v1.3</span></h1>
-                </div>
-                <div id="connection-status" class="flex items-center gap-2 text-[10px] font-bold text-emerald-500 bg-emerald-500/10 px-2 py-1 rounded-full border border-emerald-500/20">
-                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse"></span> MONITORING LIVE
-                </div>
+        <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
+            <div class="max-w-5xl mx-auto flex justify-between items-center">
+                <div class="flex items-center gap-2 text-white font-bold"><span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.4.6</span></div>
+                <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full"><span class="w-1.5 h-1.5 bg-emerald-500 rounded-full inline-block mr-1 pulse"></span> LIVE</div>
             </div>
         </nav>
-
-        <main class="max-w-6xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div class="lg:col-span-2 space-y-8">
-                <section>
-                    <div class="flex items-center justify-between mb-4">
-                        <h2 class="text-sm font-bold uppercase tracking-widest text-slate-500">Agentes Activos</h2>
-                        <span id="active-count" class="text-xs font-mono text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">0</span>
-                    </div>
-                    <div id="active-list" class="grid gap-3"></div>
-                </section>
+        <main class="max-w-5xl mx-auto p-6 space-y-6">
+            <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="bg-blue-500/5 border border-blue-500/20 p-4 rounded-xl text-center">
+                    <div class="text-[10px] text-blue-400 font-bold uppercase mb-1">API Cost (24h)</div>
+                    <div class="text-3xl font-bold text-white">$<span id="cost">0.0000</span></div>
+                </div>
+                <div class="bg-slate-800/40 p-4 rounded-xl text-center">
+                    <div class="text-[10px] text-slate-500 font-bold uppercase mb-1">Tokens In</div>
+                    <div id="tin" class="text-xl font-bold text-white">0</div>
+                </div>
+                <div class="bg-slate-800/40 p-4 rounded-xl text-center">
+                    <div class="text-[10px] text-slate-500 font-bold uppercase mb-1">Tokens Out</div>
+                    <div id="tout" class="text-xl font-bold text-white">0</div>
+                </div>
+            </section>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="lg:col-span-2 space-y-4">
+                    <h2 class="text-xs font-bold text-slate-500 uppercase">Active Agents</h2>
+                    <div id="active" class="grid gap-2"></div>
+                </div>
+                <div class="space-y-4">
+                    <h2 class="text-xs font-bold text-slate-500 uppercase">History</h2>
+                    <div id="history" class="space-y-2 border-l border-slate-800 pl-4"></div>
+                </div>
             </div>
-
-            <aside class="space-y-8">
-                <section>
-                    <h2 class="text-sm font-bold uppercase tracking-widest text-slate-500 mb-4">Historial Reciente</h2>
-                    <div id="history-list" class="space-y-2 border-l border-slate-800 ml-2"></div>
-                </section>
-            </aside>
         </main>
-
         <script>
-            async function update() {
+            async function upd() {
                 try {
-                    const res = await fetch('/api/status');
-                    const data = await res.json();
-                    
-                    const activeList = document.getElementById('active-list');
-                    document.getElementById('active-count').innerText = data.active.length;
-                    
-                    if(data.active.length === 0) {
-                        activeList.innerHTML = '<div class="py-12 border border-dashed border-slate-800 rounded-2xl text-center text-slate-600 text-sm">Silencio en el sistema...</div>';
-                    } else {
-                        activeList.innerHTML = data.active.map(a => `
-                            <div class="bg-[#1e293b]/40 border border-slate-800 p-4 rounded-xl transition-all ${a.name === 'Alfred' ? 'alfred-glow bg-blue-500/5' : ''}">
-                                <div class="flex justify-between items-center mb-1">
-                                    <div class="flex items-center gap-2">
-                                        <span class="font-bold ${a.name === 'Alfred' ? 'text-blue-400' : 'text-slate-200'}">${a.name}</span>
-                                        ${a.count > 1 ? `<span class="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full border border-slate-700">${a.count} tareas</span>` : ''}
-                                    </div>
-                                    <span class="text-[9px] font-mono text-slate-500 italic">${a.last_seen}s ago</span>
-                                </div>
-                                <p class="text-xs text-slate-500 truncate font-mono bg-black/20 p-2 rounded mt-2 border border-white/5">
-                                    <span class="text-blue-500/50 mr-1">$</span>${a.last_message}
-                                </p>
+                    const r = await fetch('/api/status');
+                    const d = await r.json();
+                    document.getElementById('cost').innerText = d.totals.cost.toFixed(4);
+                    document.getElementById('tin').innerText = d.totals.in.toLocaleString();
+                    document.getElementById('tout').innerText = d.totals.out.toLocaleString();
+                    document.getElementById('active').innerHTML = d.active.map(a => `
+                        <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg ${a.name==='Alfred'?'alfred':''}">
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="font-bold ${a.name==='Alfred'?'text-blue-400':'text-white'}">${a.name} ${a.count>1?'('+a.count+')':''}</span>
+                                <span class="text-slate-600 font-mono">${a.id}</span>
                             </div>
-                        `).join('');
-                    }
-
-                    const historyList = document.getElementById('history-list');
-                    historyList.innerHTML = data.history.length ? data.history.map(h => `
-                        <div class="pl-4 pb-4 relative">
-                            <div class="absolute w-2 h-2 bg-slate-800 rounded-full -left-[4.5px] top-1.5 border border-[#0b1120]"></div>
-                            <div class="text-[9px] text-slate-600 font-mono mb-0.5">${h.time}</div>
-                            <div class="text-xs font-semibold text-slate-400">${h.agent}</div>
-                            <div class="text-[10px] text-slate-600 truncate">${h.task}</div>
+                            <div class="text-[11px] text-slate-500 italic truncate">$ ${a.last}</div>
                         </div>
-                    `).join('') : '<div class="pl-4 text-slate-700 text-[10px] italic">Esperando eventos...</div>';
-
-                } catch (e) { console.error(e); }
+                    `).join('') || '<div class="text-slate-700 text-xs py-4 text-center">Quiet...</div>';
+                    document.getElementById('history').innerHTML = d.history.map(h => `
+                        <div class="text-[10px]"><span class="text-slate-600">${h.time}</span> <span class="text-slate-400 font-bold">${h.agent}</span></div>
+                    `).join('');
+                } catch(e){}
             }
-            setInterval(update, 2000);
-            update();
+            setInterval(upd, 2000); upd();
         </script>
     </body>
     </html>
