@@ -15,7 +15,13 @@ SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
-# --- Global Cache (v1.9.0) ---
+# Pricing for Gemini 2.0 Flash (Primary Model) - Updated 2026-02-20
+# Input: $0.10 per 1M tokens ($0.0000001 per token)
+# Output: $0.40 per 1M tokens ($0.0000004 per token)
+PRICING_INPUT = 0.10 / 1000000
+PRICING_OUTPUT = 0.40 / 1000000
+
+# --- Global Cache (v1.9.1) ---
 dashboard_cache = {
     "active": [],
     "totals": {"cost": 0.0, "in": 0, "out": 0},
@@ -58,19 +64,6 @@ def get_alias(session_id: str) -> str:
     conn.close()
     return alias
 
-def extract_cost(obj):
-    cost = 0.0
-    if isinstance(obj, dict):
-        if "total" in obj and isinstance(obj["total"], (int, float)):
-            return float(obj["total"])
-        if "cost" in obj:
-            c = obj["cost"]
-            if isinstance(c, dict): return extract_cost(c)
-            elif isinstance(c, (int, float)): return float(c)
-        for k in ["usage", "message"]:
-            if k in obj: cost += extract_cost(obj[k])
-    return cost
-
 def extract_usage(obj):
     usage = {"in": 0, "out": 0}
     if isinstance(obj, dict):
@@ -85,12 +78,15 @@ def extract_usage(obj):
             usage["out"] += res["out"]
     return usage
 
+def calculate_real_cost(usage: dict) -> float:
+    return (usage["in"] * PRICING_INPUT) + (usage["out"] * PRICING_OUTPUT)
+
 # --- Background Task ---
 async def update_cache_loop():
     while True:
         try:
             active_map: Dict[str, dict] = {}
-            total_cost = 0.0
+            total_real_cost = 0.0
             total_tokens_in = 0
             total_tokens_out = 0
             now = datetime.now().timestamp()
@@ -104,18 +100,20 @@ async def update_cache_loop():
                         mtime = os.path.getmtime(filepath)
                         ctime = os.path.getctime(filepath)
                         
-                        sess_cost = 0.0
+                        sess_usage = {"in": 0, "out": 0}
                         with open(filepath, 'r') as f:
                             for line in f:
                                 try:
                                     data = json.loads(line.strip())
-                                    c = extract_cost(data)
-                                    sess_cost += c
-                                    total_cost += c
                                     usage = extract_usage(data)
-                                    total_tokens_in += usage["in"]
-                                    total_tokens_out += usage["out"]
+                                    sess_usage["in"] += usage["in"]
+                                    sess_usage["out"] += usage["out"]
                                 except: continue
+
+                        sess_cost = calculate_real_cost(sess_usage)
+                        total_real_cost += sess_cost
+                        total_tokens_in += sess_usage["in"]
+                        total_tokens_out += sess_usage["out"]
 
                         if (now - mtime) < 120:
                             alias = get_alias(session_id)
@@ -151,7 +149,7 @@ async def update_cache_loop():
                     except: continue
 
             dashboard_cache["active"] = list(active_map.values())
-            dashboard_cache["totals"] = {"cost": round(total_cost, 4), "in": total_tokens_in, "out": total_tokens_out}
+            dashboard_cache["totals"] = {"cost": round(total_real_cost, 6), "in": total_tokens_in, "out": total_tokens_out}
             
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -169,21 +167,19 @@ async def update_cache_loop():
         await asyncio.sleep(10)
 
 # --- FastAPI & Security ---
-app = FastAPI(title="OpenClaw Insight Dashboard v1.9.0")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.9.1")
 
 @app.middleware("http")
 async def secure_local_network(request: Request, call_next):
     client_ip = request.client.host
     if client_ip == "127.0.0.1" or client_ip == "::1":
         return await call_next(request)
-    
     try:
         ip = ipaddress.ip_address(client_ip)
         if not ip.is_private:
-            raise HTTPException(status_code=403, detail="Access denied: Only local network allowed")
+            raise HTTPException(status_code=403, detail="Access denied")
     except ValueError:
-        raise HTTPException(status_code=403, detail="Invalid client IP")
-    
+        raise HTTPException(status_code=403, detail="Invalid IP")
     return await call_next(request)
 
 @app.on_event("startup")
@@ -198,23 +194,21 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OpenClaw Insight v1.9.0</title>
-        <script src="https://cdn.tailwindcss.com"></script>
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>OpenClaw Insight v1.9.1</title><script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center px-4">
-                <div class="flex items-center gap-2 text-white font-bold">🎩 <span class="hidden sm:inline">Insight</span> v1.9.0</div>
+                <div class="flex items-center gap-2 text-white font-bold">🎩 Insight v1.9.1</div>
                 <div id="update-ts" class="text-[10px] text-slate-500"></div>
             </div>
         </nav>
         <main class="max-w-5xl mx-auto p-4 sm:p-6 space-y-6">
             <section class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
-                    <div class="text-[10px] text-blue-400 font-bold uppercase">Cost (24h)</div>
-                    <div class="text-2xl font-bold text-white">$<span id="cost">0.00</span></div>
+                    <div class="text-[10px] text-blue-400 font-bold uppercase">Real Cost (Gemini 2.0 Flash)</div>
+                    <div class="text-2xl font-bold text-white">$<span id="cost">0.000000</span></div>
                 </div>
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
                     <div class="text-[10px] text-slate-500 font-bold uppercase">Tokens In</div>
@@ -241,15 +235,15 @@ async def index():
                 try {
                     const r = await fetch('/api/status');
                     const d = await r.json();
-                    document.getElementById('cost').innerText = d.totals.cost.toFixed(4);
+                    document.getElementById('cost').innerText = d.totals.cost.toFixed(6);
                     document.getElementById('tin').innerText = d.totals.in.toLocaleString();
                     document.getElementById('tout').innerText = d.totals.out.toLocaleString();
                     document.getElementById('active').innerHTML = d.active.map(a => `
-                        <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg"><div class="flex justify-between text-xs"><span class="font-bold text-white">${a.name}</span><span class="text-emerald-500">$${a.cost.toFixed(4)}</span></div></div>
+                        <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg"><div class="flex justify-between text-xs"><span class="font-bold text-white">${a.name}</span><span class="text-emerald-500">$${a.cost.toFixed(6)}</span></div></div>
                     `).join('') || '<div class="text-slate-700 text-xs py-4 text-center">No active tasks</div>';
                     document.getElementById('history').innerHTML = d.history.map(h => `
                         <div class="text-[11px] border-b border-slate-800/50 pb-2 px-1">
-                            <div class="flex justify-between font-bold text-slate-400"><span>${h.status} ${h.agent}</span><span class="text-emerald-500">$${h.cost.toFixed(3)}</span></div>
+                            <div class="flex justify-between font-bold text-slate-400"><span>${h.status} ${h.agent}</span><span class="text-emerald-500">$${h.cost.toFixed(4)}</span></div>
                             <div class="text-slate-500 leading-tight my-1">${h.task}</div>
                             <div class="flex justify-between text-[10px] text-slate-600"><span>${h.time}</span><span>${Math.round(h.duration/60000)} min</span></div>
                         </div>
