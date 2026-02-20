@@ -235,7 +235,7 @@ async def index():
                 try {
                     const r = await fetch('/api/status');
                     const d = await r.json();
-                    document.getElementById('cost').innerText = d.totals.cost.toFixed(6);
+                    document.getElementById('cost').innerText = d.totals.cost.toFixed(2);
                     document.getElementById('tin').innerText = d.totals.in.toLocaleString();
                     document.getElementById('tout').innerText = d.totals.out.toLocaleString();
                     document.getElementById('active').innerHTML = d.active.map(a => `
