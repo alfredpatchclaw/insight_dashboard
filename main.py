@@ -14,7 +14,7 @@ SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
-# --- Global Cache (v1.6 Performance) ---
+# --- Global Cache (v1.8.0) ---
 dashboard_cache = {
     "active": [],
     "totals": {"cost": 0.0, "in": 0, "out": 0},
@@ -31,12 +31,13 @@ def init_db():
                   timestamp TEXT, 
                   agent_id TEXT, 
                   agent_name TEXT, 
-                  task TEXT)''')
+                  task TEXT,
+                  duration_ms INTEGER,
+                  cost REAL,
+                  status TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS agent_aliases
                  (session_id TEXT PRIMARY KEY, 
                   alias TEXT)''')
-    c.execute("INSERT OR IGNORE INTO agent_aliases (session_id, alias) VALUES (?, ?)", 
-              ("b6a17b63-f710-444a-9091-74c2ea6238d6", "Alfred"))
     conn.commit()
     conn.close()
 
@@ -83,20 +84,9 @@ def extract_usage(obj):
             usage["out"] += res["out"]
     return usage
 
-def is_calling_claude(obj):
-    if isinstance(obj, dict) and obj.get("type") == "message":
-        msg = obj.get("message", {})
-        content = msg.get("content", [])
-        if isinstance(content, list):
-            for part in content:
-                if part.get("type") == "toolCall" and part.get("name") == "exec":
-                    args = part.get("arguments", {})
-                    cmd = args.get("command", "")
-                    if "claude" in cmd.lower(): return True
-    return False
-
-# --- Background Task (The Engine) ---
+# --- Background Task ---
 async def update_cache_loop():
+    known_sessions = set()
     while True:
         try:
             active_map: Dict[str, dict] = {}
@@ -106,84 +96,74 @@ async def update_cache_loop():
             now = datetime.now().timestamp()
             
             if os.path.exists(SESSIONS_DIR):
-                files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl") and not f.endswith(".lock")]
+                files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl")]
                 for filename in files:
                     filepath = os.path.join(SESSIONS_DIR, filename)
                     session_id = filename.split('.')[0]
                     try:
                         mtime = os.path.getmtime(filepath)
-                        if (now - mtime) > 86400: continue
-
-                        using_claude = False
+                        ctime = os.path.getctime(filepath)
+                        
+                        sess_cost = 0.0
                         last_msg = "Working..."
                         
                         with open(filepath, 'r') as f:
                             for line in f:
                                 try:
                                     data = json.loads(line.strip())
-                                    total_cost += extract_cost(data)
+                                    c = extract_cost(data)
+                                    sess_cost += c
+                                    total_cost += c
                                     usage = extract_usage(data)
                                     total_tokens_in += usage["in"]
                                     total_tokens_out += usage["out"]
-                                    if is_calling_claude(data): using_claude = True
                                 except: continue
 
+                        # Session is "active" if modified in the last 2 minutes
                         if (now - mtime) < 120:
-                            with open(filepath, 'rb') as f:
-                                try:
-                                    f.seek(-2, os.SEEK_END)
-                                    while f.read(1) != b'\n': f.seek(-2, os.SEEK_CUR)
-                                except: f.seek(0)
-                                last_data = json.loads(f.readline().decode())
-                                if last_data.get("type") == "message":
-                                    m = last_data["message"]
-                                    content = m.get("content", [])
-                                    if isinstance(content, list):
-                                        for c in content:
-                                            if c.get("type") == "text": last_msg = c.get("text", "")
-                                    elif isinstance(content, str): last_msg = content
-                            
-                            if not any(kw in last_msg.lower() for kw in ["dashboard on port 8050 is down", "reactivado"]):
-                                alias = get_alias(session_id)
-                                if alias not in active_map:
-                                    active_map[alias] = {
-                                        "name": alias, "id": session_id[:8], 
-                                        "last": last_msg[:80], "count": 1, 
-                                        "mtime": mtime, "using_claude": using_claude
-                                    }
-                                else:
-                                    active_map[alias]["count"] += 1
-                                    if using_claude: active_map[alias]["using_claude"] = True
+                            alias = get_alias(session_id)
+                            active_map[alias] = {
+                                "name": alias, "id": session_id[:8], 
+                                "mtime": mtime, "cost": sess_cost
+                            }
+                        
+                        # Save to history if session is finished (older than 10 mins and not in DB)
+                        elif (now - mtime) > 600 and session_id not in known_sessions:
+                            duration = int((mtime - ctime) * 1000)
+                            alias = get_alias(session_id)
+                            conn = sqlite3.connect(DB_PATH)
+                            c_db = conn.cursor()
+                            c_db.execute("INSERT INTO history (timestamp, agent_id, agent_name, task, duration_ms, cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                      (datetime.fromtimestamp(mtime).isoformat(), session_id, alias, "Task completed", duration, sess_cost, "✅"))
+                            conn.commit()
+                            conn.close()
+                            known_sessions.add(session_id)
+
                     except: continue
 
             # Update Global Cache
-            dashboard_cache["active"] = sorted(list(active_map.values()), key=lambda x: (x['name'] != 'Alfred', x['mtime']))
+            dashboard_cache["active"] = list(active_map.values())
             dashboard_cache["totals"] = {"cost": round(total_cost, 4), "in": total_tokens_in, "out": total_tokens_out}
             
-            # Update History from DB
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT 15")
-            dashboard_cache["history"] = [{"id": r[0], "time": r[1].split('T')[1].split('.')[0] if 'T' in r[1] else r[1], "agent": r[3], "task": r[4]} for r in c.fetchall()]
+            c.execute("SELECT timestamp, agent_name, task, duration_ms, cost, status FROM history ORDER BY timestamp DESC LIMIT 10")
+            dashboard_cache["history"] = [{"time": r[0].split('T')[1][:5], "agent": r[1], "task": r[2], "duration": r[3], "cost": r[4], "status": r[5]} for r in c.fetchall()]
             conn.close()
             
             dashboard_cache["last_update"] = datetime.now().isoformat()
-            
-        except Exception as e:
-            print(f"Cache update error: {e}")
-            
-        await asyncio.sleep(10) # Update every 10 seconds
+        except Exception as e: print(f"Error: {e}")
+        await asyncio.sleep(10)
 
 # --- FastAPI App ---
-app = FastAPI(title="OpenClaw Insight Dashboard v1.6")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.8.0")
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(update_cache_loop())
 
 @app.get("/api/status")
-async def get_status():
-    return dashboard_cache
+async def get_status(): return dashboard_cache
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -191,41 +171,29 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>OpenClaw Insight v1.6 (Turbo)</title>
+        <meta charset="UTF-8"><title>OpenClaw Insight v1.8.0</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <style> 
-            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } 
-            @keyframes glow { 0%, 100% { text-shadow: 0 0 5px #a855f7; } 50% { text-shadow: 0 0 20px #a855f7; } }
-            .pulse { animation: pulse 2s infinite; } 
-            .claude-icon { color: #a855f7; animation: glow 2s infinite; }
-            .alfred { border-color: rgba(59,130,246,0.5); box-shadow: 0 0 10px rgba(59,130,246,0.2); } 
-        </style>
     </head>
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center">
-                <div class="flex items-center gap-2 text-white font-bold">
-                    <span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.6 (Turbo)</span>
-                </div>
-                <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full flex items-center gap-2">
-                    <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse"></span> CACHED LIVE
-                    <span id="update-ts" class="text-slate-500 font-normal"></span>
-                </div>
+                <div class="flex items-center gap-2 text-white font-bold">🎩 Insight v1.8.0</div>
+                <div id="update-ts" class="text-[10px] text-slate-500"></div>
             </div>
         </nav>
         <main class="max-w-5xl mx-auto p-6 space-y-6">
-            <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div class="bg-blue-500/5 border border-blue-500/20 p-4 rounded-xl text-center">
-                    <div class="text-[10px] text-blue-400 font-bold uppercase mb-1">API Cost (24h)</div>
-                    <div class="text-3xl font-bold text-white">$<span id="cost">0.0000</span></div>
+            <section class="grid grid-cols-3 gap-4">
+                <div class="bg-slate-800/40 p-4 rounded-xl text-center">
+                    <div class="text-[10px] text-blue-400 font-bold uppercase">Cost (24h)</div>
+                    <div class="text-2xl font-bold text-white">$<span id="cost">0.00</span></div>
                 </div>
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
-                    <div class="text-[10px] text-slate-500 font-bold uppercase mb-1">Tokens In</div>
-                    <div id="tin" class="text-xl font-bold text-white">0</div>
+                    <div class="text-[10px] text-slate-500 font-bold uppercase">Tokens In</div>
+                    <div id="tin" class="text-xl font-bold">0</div>
                 </div>
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
-                    <div class="text-[10px] text-slate-500 font-bold uppercase mb-1">Tokens Out</div>
-                    <div id="tout" class="text-xl font-bold text-white">0</div>
+                    <div class="text-[10px] text-slate-500 font-bold uppercase">Tokens Out</div>
+                    <div id="tout" class="text-xl font-bold">0</div>
                 </div>
             </section>
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -234,8 +202,8 @@ async def index():
                     <div id="active" class="grid gap-2"></div>
                 </div>
                 <div class="space-y-4">
-                    <h2 class="text-xs font-bold text-slate-500 uppercase">History</h2>
-                    <div id="history" class="space-y-2 border-l border-slate-800 pl-4"></div>
+                    <h2 class="text-xs font-bold text-slate-500 uppercase">High-Level History</h2>
+                    <div id="history" class="space-y-3 pl-4 border-l border-slate-800"></div>
                 </div>
             </div>
         </main>
@@ -244,28 +212,33 @@ async def index():
                 try {
                     const r = await fetch('/api/status');
                     const d = await r.json();
-                    if(d.last_update) document.getElementById('update-ts').innerText = 'Last sync: ' + d.last_update.split('T')[1].split('.')[0];
                     document.getElementById('cost').innerText = d.totals.cost.toFixed(4);
                     document.getElementById('tin').innerText = d.totals.in.toLocaleString();
                     document.getElementById('tout').innerText = d.totals.out.toLocaleString();
                     document.getElementById('active').innerHTML = d.active.map(a => `
-                        <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg ${a.name==='Alfred'?'alfred':''}">
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="font-bold flex items-center gap-2 ${a.name==='Alfred'?'text-blue-400':'text-white'}">
-                                    ${a.name} ${a.count>1?'('+a.count+')':''}
-                                    ${a.using_claude ? '<span class="claude-icon">⚡</span>' : ''}
-                                </span>
-                                <span class="text-slate-600 font-mono">${a.id}</span>
+                        <div class="bg-slate-800/30 border border-slate-800 p-3 rounded-lg">
+                            <div class="flex justify-between text-xs">
+                                <span class="font-bold text-white">${a.name}</span>
+                                <span class="text-emerald-500">$${a.cost.toFixed(4)}</span>
                             </div>
-                            <div class="text-[11px] text-slate-500 italic truncate">$ ${a.last}</div>
                         </div>
-                    `).join('') || '<div class="text-slate-700 text-xs py-4 text-center">Quiet...</div>';
+                    `).join('') || '<div class="text-slate-700 text-xs py-4 text-center">No active tasks</div>';
                     document.getElementById('history').innerHTML = d.history.map(h => `
-                        <div class="text-[10px]"><span class="text-slate-600">${h.time}</span> <span class="text-slate-400 font-bold">${h.agent}</span></div>
+                        <div class="text-[11px] border-b border-slate-800/50 pb-2">
+                            <div class="flex justify-between font-bold text-slate-400">
+                                <span>${h.status} ${h.agent}</span>
+                                <span class="text-emerald-500">$${h.cost.toFixed(3)}</span>
+                            </div>
+                            <div class="text-slate-500">${h.task}</div>
+                            <div class="flex justify-between text-[10px] text-slate-600">
+                                <span>${h.time}</span>
+                                <span>${Math.round(h.duration/60000)} min</span>
+                            </div>
+                        </div>
                     `).join('');
                 } catch(e){}
             }
-            setInterval(upd, 2000); upd();
+            setInterval(upd, 5000); upd();
         </script>
     </body>
     </html>

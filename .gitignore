@@ -1,1 +1,2 @@
-__pycache__/\nvenv/\n*.db\n.vscode/
+*.log
+history.db
