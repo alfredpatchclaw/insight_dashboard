@@ -131,10 +131,28 @@ async def update_cache_loop():
                         elif (now - mtime) > 600 and session_id not in known_sessions:
                             duration = int((mtime - ctime) * 1000)
                             alias = get_alias(session_id)
+                            
+                            # Extract a one-sentence summary of the task
+                            task_summary = "Task completed"
+                            try:
+                                with open(filepath, 'r') as f:
+                                    first_line = f.readline()
+                                    if first_line:
+                                        first_data = json.loads(first_line.strip())
+                                        if first_data.get("type") == "message":
+                                            content = first_data["message"].get("content", "")
+                                            if isinstance(content, list):
+                                                text = next((c.get("text", "") for c in content if c.get("type") == "text"), "")
+                                            else:
+                                                text = str(content)
+                                            # Truncate to one sentence or 80 chars
+                                            task_summary = text.split('.')[0].split('\n')[0][:80].strip()
+                            except: pass
+
                             conn = sqlite3.connect(DB_PATH)
                             c_db = conn.cursor()
                             c_db.execute("INSERT INTO history (timestamp, agent_id, agent_name, task, duration_ms, cost, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                      (datetime.fromtimestamp(mtime).isoformat(), session_id, alias, "Task completed", duration, sess_cost, "✅"))
+                                      (datetime.fromtimestamp(mtime).isoformat(), session_id, alias, task_summary, duration, sess_cost, "✅"))
                             conn.commit()
                             conn.close()
                             known_sessions.add(session_id)
