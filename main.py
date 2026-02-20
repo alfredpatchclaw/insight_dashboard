@@ -14,7 +14,7 @@ SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
-# --- Global Cache (v1.6 Performance) ---
+# --- Global Cache (v1.8.0 Performance) ---
 dashboard_cache = {
     "active": [],
     "totals": {"cost": 0.0, "in": 0, "out": 0},
@@ -175,7 +175,7 @@ async def update_cache_loop():
         await asyncio.sleep(10) # Update every 10 seconds
 
 # --- FastAPI App ---
-app = FastAPI(title="OpenClaw Insight Dashboard v1.6")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.8.0")
 
 @app.on_event("startup")
 async def startup_event():
@@ -191,7 +191,7 @@ async def index():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>OpenClaw Insight v1.6 (Turbo)</title>
+        <meta charset="UTF-8"><title>OpenClaw Insight v1.8.0 (Turbo)</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <style> 
             @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } } 
@@ -205,7 +205,7 @@ async def index():
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center">
                 <div class="flex items-center gap-2 text-white font-bold">
-                    <span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.6 (Turbo)</span>
+                    <span class="text-xl">🎩</span> Insight <span class="text-xs font-normal text-slate-500">v1.8.0 (Turbo)</span>
                 </div>
                 <div class="text-[10px] text-emerald-500 font-bold bg-emerald-500/10 px-2 py-1 rounded-full flex items-center gap-2">
                     <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full pulse"></span> CACHED LIVE
