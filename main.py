@@ -15,13 +15,13 @@ SESSIONS_DIR = "/home/claw/.openclaw/agents/main/sessions"
 DB_PATH = "/home/claw/.openclaw/workspace/tools_dev/insight_dashboard/history.db"
 BUTLER_NAMES = ["Alfred", "Jarvis", "Sebastian", "Nestor", "Hudson", "Cadbury", "Geoffrey", "Woodhouse", "Agdor", "Lurch"]
 
-# Pricing for Gemini 2.0 Flash (Primary Model) - Updated 2026-02-20
-# Input: $0.10 per 1M tokens ($0.0000001 per token)
-# Output: $0.40 per 1M tokens ($0.0000004 per token)
-PRICING_INPUT = 0.10 / 1000000
-PRICING_OUTPUT = 0.40 / 1000000
+# Pricing for Gemini 3 Flash Preview (Current Model) - Updated 2026-02-20
+# Input: $0.50 per 1M tokens ($0.0000005 per token)
+# Output: $3.00 per 1M tokens ($0.000003 per token)
+PRICING_INPUT = 0.50 / 1000000
+PRICING_OUTPUT = 3.00 / 1000000
 
-# --- Global Cache (v1.9.1) ---
+# --- Global Cache (v1.9.2) ---
 dashboard_cache = {
     "active": [],
     "totals": {"cost": 0.0, "in": 0, "out": 0},
@@ -167,7 +167,7 @@ async def update_cache_loop():
         await asyncio.sleep(10)
 
 # --- FastAPI & Security ---
-app = FastAPI(title="OpenClaw Insight Dashboard v1.9.1")
+app = FastAPI(title="OpenClaw Insight Dashboard v1.9.2")
 
 @app.middleware("http")
 async def secure_local_network(request: Request, call_next):
@@ -195,19 +195,19 @@ async def index():
     <html lang="en">
     <head>
         <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OpenClaw Insight v1.9.1</title><script src="https://cdn.tailwindcss.com"></script>
+        <title>OpenClaw Insight v1.9.2</title><script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-[#0b1120] text-slate-300 font-sans min-h-screen">
         <nav class="border-b border-slate-800 bg-[#111827]/90 p-4 sticky top-0 z-50">
             <div class="max-w-5xl mx-auto flex justify-between items-center px-4">
-                <div class="flex items-center gap-2 text-white font-bold">🎩 Insight v1.9.1</div>
+                <div class="flex items-center gap-2 text-white font-bold">🎩 Insight v1.9.2</div>
                 <div id="update-ts" class="text-[10px] text-slate-500"></div>
             </div>
         </nav>
         <main class="max-w-5xl mx-auto p-4 sm:p-6 space-y-6">
             <section class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
-                    <div class="text-[10px] text-blue-400 font-bold uppercase">Real Cost (Gemini 2.0 Flash)</div>
+                    <div class="text-[10px] text-blue-400 font-bold uppercase">Real Cost (Gemini 3 Flash Preview)</div>
                     <div class="text-2xl font-bold text-white">$<span id="cost">0.000000</span></div>
                 </div>
                 <div class="bg-slate-800/40 p-4 rounded-xl text-center">
